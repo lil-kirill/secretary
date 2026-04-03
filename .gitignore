@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+
+# Данные рантайма (создаются автоматически)
+users.json
+meetings.json
+bot.db
+
+# Старые версии
+secretbot.py
+secretbot1.py
+secretbot2.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Виртуальное окружение
+venv/
+.env
