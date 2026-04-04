@@ -27,7 +27,8 @@ async def init():
             tracking_enabled INTEGER NOT NULL DEFAULT 0,
             sla              INTEGER NOT NULL DEFAULT 60,
             repeat_interval  INTEGER NOT NULL DEFAULT 120,
-            zoom_remind_before INTEGER NOT NULL DEFAULT 900
+            zoom_remind_before INTEGER NOT NULL DEFAULT 900,
+            is_approved      INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS meetings (
@@ -214,6 +215,7 @@ def _row_to_user(row: aiosqlite.Row) -> dict:
         "sla": row["sla"],
         "repeat_interval": row["repeat_interval"],
         "zoom_remind_before": row["zoom_remind_before"],
+        "is_approved": bool(row["is_approved"]),
     }
 
 
@@ -242,13 +244,14 @@ async def upsert_user(
     sla: int = 60,
     repeat_interval: int = 120,
     zoom_remind_before: int = 900,
+    is_approved: bool = False,
 ):
     await _db.execute(
         """
         INSERT INTO users
             (user_id, username, first_name, private_chat_id,
-             tracking_enabled, sla, repeat_interval, zoom_remind_before)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             tracking_enabled, sla, repeat_interval, zoom_remind_before, is_approved)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             username         = excluded.username,
             first_name       = excluded.first_name,
@@ -259,7 +262,8 @@ async def upsert_user(
             zoom_remind_before = excluded.zoom_remind_before
         """,
         (user_id, username, first_name, private_chat_id,
-         int(tracking_enabled), sla, repeat_interval, zoom_remind_before),
+         int(tracking_enabled), sla, repeat_interval, zoom_remind_before,
+         int(is_approved)),
     )
     await _db.commit()
 
@@ -268,13 +272,22 @@ async def update_user_field(user_id: int, field: str, value):
     allowed = {
         "tracking_enabled", "sla", "repeat_interval",
         "zoom_remind_before", "private_chat_id", "username", "first_name",
+        "is_approved",
     }
     if field not in allowed:
         raise ValueError(f"Недопустимое поле: {field}")
-    if field == "tracking_enabled":
+    if field in ("tracking_enabled", "is_approved"):
         value = int(value)
     await _db.execute(
         f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id)
+    )
+    await _db.commit()
+
+
+async def approve_user(user_id: int, approved: bool = True):
+    await _db.execute(
+        "UPDATE users SET is_approved = ? WHERE user_id = ?",
+        (int(approved), user_id),
     )
     await _db.commit()
 
