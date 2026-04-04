@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+from html import escape as h
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,8 @@ from conference_detector import detect_conference_links, format_meeting_id
 
 # ==== НАСТРОЙКИ ====
 TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+APPROVAL_REQUIRED = os.getenv("APPROVAL_REQUIRED", "true").lower() in ("true", "1", "yes")
 DEFAULT_SLA = 60
 DEFAULT_INTERVAL = 120
 MIN_SLA = 10
@@ -283,12 +286,12 @@ async def _get_group_link(chat_id: int, bot: Bot) -> str | None:
 def _sender_display_name(user) -> str:
     parts = []
     if user.first_name:
-        parts.append(user.first_name)
+        parts.append(h(user.first_name))
     if user.last_name:
-        parts.append(user.last_name)
+        parts.append(h(user.last_name))
     name = " ".join(parts) if parts else "Неизвестный"
     if user.username:
-        name += f" (@{user.username})"
+        name += f" (@{h(user.username)})"
     return name
 
 
@@ -773,17 +776,91 @@ async def cmd_start(msg: Message, bot: Bot):
     state["screen"] = "main"
 
     u = await db.get_user_by_id(user.id)
-    status_line = "✅ Отслеживание включено" if (u and u["tracking_enabled"]) else "⏹ Отслеживание выключено"
+    is_new = u is None
+    is_admin = user.id == ADMIN_USER_ID
 
-    # Удаляем старое меню, если было
+    # Регистрация нового пользователя
+    if is_new:
+        auto_approve = is_admin or not APPROVAL_REQUIRED
+        await db.upsert_user(
+            user_id=user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+            private_chat_id=msg.chat.id,
+            is_approved=auto_approve,
+        )
+        u = await db.get_user_by_id(user.id)
+    else:
+        # Обновляем private_chat_id
+        await db.update_user_field(user.id, "private_chat_id", msg.chat.id)
+        # Если режим без одобрения — автоматически одобряем старых
+        if not APPROVAL_REQUIRED and not u.get("is_approved"):
+            await db.approve_user(user.id, True)
+            u = await db.get_user_by_id(user.id)
+
+    # Удаляем старое меню
     old_id = state.get("menu_msg_id")
     if old_id:
         try:
             await bot.delete_message(msg.chat.id, old_id)
         except Exception:
             pass
+        state["menu_msg_id"] = None
 
-    # Приветствие (обычное сообщение, без клавиатуры)
+    # Если нужно одобрение и не одобрен — заявка админу
+    if APPROVAL_REQUIRED and not u.get("is_approved") and not is_admin:
+        # Отправляем заявку админу (и при первом /start, и при повторном)
+        if ADMIN_USER_ID:
+            name = h(user.first_name or "")
+            uname = f" (@{h(user.username)})" if user.username else ""
+            label = "Повторная заявка" if not is_new else "Новая заявка"
+            kb = _ikb([
+                [("✅ Одобрить", f"adm_approve_{user.id}"),
+                 ("❌ Отклонить", f"adm_reject_{user.id}")],
+            ])
+            try:
+                # Отправляем заявку админу, не сбивая его меню
+                admin_state = _get_state(ADMIN_USER_ID)
+                admin_menu = admin_state.get("menu_msg_id")
+                admin_chat = (await db.get_user_by_id(ADMIN_USER_ID) or {}).get("private_chat_id")
+                if admin_chat:
+                    # Удаляем старое меню админа
+                    if admin_menu:
+                        try:
+                            await bot.delete_message(admin_chat, admin_menu)
+                        except Exception:
+                            pass
+
+                    # Отправляем заявку
+                    await bot.send_message(
+                        admin_chat,
+                        f"📋 <b>{label}</b>\n\n"
+                        f"Пользователь: {name}{uname}\n"
+                        f"ID: <code>{user.id}</code>",
+                        reply_markup=kb,
+                        parse_mode="HTML",
+                    )
+
+                    # Пересоздаём меню админа внизу
+                    await _recreate_menu_below(bot, ADMIN_USER_ID, admin_chat)
+
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить админа: {e}")
+
+        # Сообщение пользователю (без меню — он не одобрен)
+        await bot.send_message(
+            msg.chat.id,
+            "👋 Привет! Я бот-секретарь.\n\n"
+            "⏳ Ваша заявка отправлена администратору.\n"
+            "Вы получите уведомление, когда доступ будет открыт.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        logger.info(f"Заявка: user_id={user.id} @{user.username} (new={is_new})")
+        return
+
+    # Одобренный пользователь — показываем меню
+    status_line = "✅ Отслеживание включено" if (u and u["tracking_enabled"]) else "⏹ Отслеживание выключено"
+
     await bot.send_message(
         msg.chat.id,
         "👋 Привет! Я бот-секретарь.\n\n"
@@ -792,7 +869,6 @@ async def cmd_start(msg: Message, bot: Bot):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # Меню (отдельное сообщение с инлайн-кнопками)
     sent = await bot.send_message(
         msg.chat.id,
         f"{status_line}\n\nВыберите действие:",
@@ -807,11 +883,58 @@ async def cmd_start(msg: Message, bot: Bot):
 # ====================================================================
 @private_router.callback_query(F.message.chat.type == ChatType.PRIVATE)
 async def handle_callback(query: CallbackQuery, bot: Bot):
+    if not query.message:
+        await query.answer()
+        return
     user = query.from_user
     uid = user.id
     chat_id = query.message.chat.id
     data = query.data or ""
     state = _get_state(uid)
+
+    # ---- Админ: одобрение/отклонение заявок ----
+    if data.startswith("adm_approve_") or data.startswith("adm_reject_"):
+        if uid != ADMIN_USER_ID:
+            await query.answer("Нет прав.")
+            return
+        try:
+            target_uid = int(data.split("_")[-1])
+        except (ValueError, IndexError):
+            await query.answer("Некорректные данные.")
+            return
+        if data.startswith("adm_approve_"):
+            await db.approve_user(target_uid, True)
+            await query.message.edit_text(
+                query.message.text + "\n\n✅ Одобрен",
+                parse_mode="HTML",
+            )
+            # Уведомляем пользователя
+            target_user = await db.get_user_by_id(target_uid)
+            if target_user and target_user.get("private_chat_id"):
+                try:
+                    await bot.send_message(
+                        target_user["private_chat_id"],
+                        "✅ <b>Доступ одобрен!</b>\n\nНапишите /start, чтобы начать.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            logger.info(f"Пользователь {target_uid} одобрен админом")
+        else:
+            await db.approve_user(target_uid, False)
+            await query.message.edit_text(
+                query.message.text + "\n\n❌ Отклонён",
+                parse_mode="HTML",
+            )
+            logger.info(f"Пользователь {target_uid} отклонён админом")
+        await query.answer()
+        return
+
+    # ---- Проверка is_approved для всех остальных действий ----
+    u = await db.get_user_by_id(uid)
+    if u and not u.get("is_approved"):
+        await query.answer("⏳ Ваша заявка ещё не одобрена.", show_alert=True)
+        return
 
     # Ensure menu_msg_id is tracked
     if query.message and query.message.message_id:
