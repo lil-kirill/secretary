@@ -543,9 +543,15 @@ async def _reminder_loop(
                     "(Напишите мне /start в ЛС, чтобы получать уведомления лично.)",
                 )
             else:
+                # Кнопка «Прочитано» — отключает напоминание
+                read_kb = _ikb([[
+                    ("✅ Прочитано", f"read_{chat_id}_{user_id}"),
+                ]])
                 await bot.send_message(
                     private_chat_id, reminder,
-                    parse_mode="HTML", disable_web_page_preview=True,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=read_kb,
                 )
                 # Пересоздаём меню внизу, чтобы оно не терялось
                 await _recreate_menu_below(bot, user_id, private_chat_id)
@@ -891,6 +897,44 @@ async def handle_callback(query: CallbackQuery, bot: Bot):
     chat_id = query.message.chat.id
     data = query.data or ""
     state = _get_state(uid)
+
+    # ---- Кнопка «Прочитано» на напоминании ----
+    if data.startswith("read_"):
+        try:
+            parts = data.split("_")
+            r_chat_id = int(parts[1])
+            r_user_id = int(parts[2])
+        except (ValueError, IndexError):
+            await query.answer("Некорректные данные.")
+            return
+
+        # Проверяем что это тот же пользователь, кому было напоминание
+        if uid != r_user_id:
+            await query.answer("Это не ваше напоминание.")
+            return
+
+        # Отменяем таймер
+        key = (r_chat_id, r_user_id)
+        if key in pending:
+            _cancel_pending(r_chat_id, r_user_id)
+            logger.info(f"user_id={r_user_id} нажал «Прочитано» в чате {r_chat_id}, таймер снят")
+
+        # Убираем кнопку и отмечаем как прочитанное
+        try:
+            new_text = (query.message.html_text or query.message.text or "") + "\n\n✅ <i>Прочитано</i>"
+            await query.message.edit_text(
+                new_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            try:
+                await query.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        await query.answer("Напоминание отключено")
+        return
 
     # ---- Админ: одобрение/отклонение заявок ----
     if data.startswith("adm_approve_") or data.startswith("adm_reject_"):
